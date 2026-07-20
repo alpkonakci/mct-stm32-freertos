@@ -34,7 +34,7 @@ CAN hattının iki fiziksel ucunda 120 ohm sonlandırma bulunmalıdır. Güç ka
 Her STM32CubeIDE projesinde esas uygulama dosyası `Core/Src/main.c` dosyasıdır.
 
 ```text
-MCT-RTOS-REWRITING/
+mct-stm32-freertos/
 |-- Motor_Control/
 |-- Bridge_Control/
 |-- Sensor_Control/
@@ -365,7 +365,7 @@ Place one 120-ohm termination resistor at each physical end of the CAN bus. With
 The main application implementation for each STM32CubeIDE project is in `Core/Src/main.c`.
 
 ```text
-MCT-RTOS-REWRITING/
+mct-stm32-freertos/
 |-- Motor_Control/
 |-- Bridge_Control/
 |-- Sensor_Control/

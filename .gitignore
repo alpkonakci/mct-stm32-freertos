@@ -1,0 +1,18 @@
+# STM32CubeIDE generated build directories
+**/Debug/
+**/Release/
+
+# Generated firmware and analysis artifacts
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.size.stdout
+
+# Local IDE metadata
+.metadata/
