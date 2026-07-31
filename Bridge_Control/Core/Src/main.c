@@ -62,6 +62,8 @@ static TIM_HandleTypeDef htim2HalTick;
 
 #define CAN_ID_MOTOR_CMD                   0x101U
 #define CAN_ID_SENSOR_CMD                  0x102U
+#define CAN_ID_MOTOR_ACK                   0x181U
+#define CAN_ID_MOTOR_TELEM                 0x201U
 #define CAN_ID_MOTOR_STATUS                0x211U
 #define CAN_ID_MOTOR_FAULT                 0x221U
 #define CAN_ID_SENSOR_TELEM                0x202U
@@ -71,10 +73,10 @@ static TIM_HandleTypeDef htim2HalTick;
 #define SENSOR_DEBUG_TEXT_ENABLE           0U
 
 #define ALARM_REASON_NONE                  0U
-#define ALARM_REASON_ESTOP_CMD             1U
-#define ALARM_REASON_SENSOR_VIB            2U
-#define ALARM_REASON_MOTOR_FAULT           3U
-#define ALARM_REASON_SENSOR_FAULT          4U
+#define ALARM_REASON_ESTOP_CMD             (1U << 0U)
+#define ALARM_REASON_SENSOR_VIB            (1U << 1U)
+#define ALARM_REASON_MOTOR_FAULT           (1U << 2U)
+#define ALARM_REASON_SENSOR_FAULT          (1U << 3U)
 
 #define BRIDGE_TASK_PRIORITY               5U
 #define CAN_TX_TASK_PRIORITY               4U
@@ -128,7 +130,7 @@ typedef struct {
   uint8_t lastSensorOk;
   uint8_t sensorDebugTextEnabled;
   uint8_t alarmActive;
-  uint8_t alarmReason;
+  uint8_t alarmReasons;
   uint8_t canUartOutputEnabled;
 } BridgeContext_t;
 
@@ -138,7 +140,7 @@ static BridgeContext_t bridge = {
   .lastSensorOk = 0U,
   .sensorDebugTextEnabled = SENSOR_DEBUG_TEXT_ENABLE,
   .alarmActive = 0U,
-  .alarmReason = ALARM_REASON_NONE,
+  .alarmReasons = ALARM_REASON_NONE,
   .canUartOutputEnabled = 1U
 };
 
@@ -223,9 +225,8 @@ static void Bridge_HandlePing(void);
 static void Bridge_SendStatusLine(const char *tag);
 static void Bridge_SendHeartbeat(void);
 
-static void Alarm_Set(uint8_t active, uint8_t reason);
 static void Alarm_Trigger(uint8_t reason);
-static void Alarm_Clear(void);
+static void Alarm_ClearReason(uint8_t reason);
 static void Alarm_UpdateOutputs(void);
 static void Alarm_HandleCanFrame(const CanFrame_t *frame);
 static void SensorTelemetry_Update(const CanFrame_t *frame);
@@ -443,12 +444,6 @@ static bool Bridge_PostEvent(const BridgeEvent_t *event, bool urgent)
     xQueueSendToFront(bridgeEventQueue, event, 0U) :
     xQueueSendToBack(bridgeEventQueue, event, 0U);
 
-  if ((result != pdPASS) && urgent) {
-    BridgeEvent_t discarded;
-    (void)xQueueReceive(bridgeEventQueue, &discarded, 0U);
-    result = xQueueSendToFront(bridgeEventQueue, event, 0U);
-  }
-
   return result == pdPASS;
 }
 
@@ -537,26 +532,30 @@ static void Bridge_HandleCanRx(const CanFrame_t *frame)
 static void Bridge_HandleUartCanTx(const CanFrame_t *frame)
 {
   bool urgent = false;
+  char command = '\0';
+  bool motorCommand = false;
 
   if (!frame->extended &&
       ((frame->id == CAN_ID_MOTOR_CMD) ||
        (frame->id == CAN_ID_SENSOR_CMD)) &&
       (frame->dlc >= 1U)) {
-    char command = ToUpperAscii((char)frame->data[0]);
+    command = ToUpperAscii((char)frame->data[0]);
+    motorCommand = (frame->id == CAN_ID_MOTOR_CMD);
 
-    if (command == 'D') {
-      bridge.canUartOutputEnabled = 0U;
-      Alarm_Trigger(ALARM_REASON_ESTOP_CMD);
+    if ((command == 'D') || (command == 'X')) {
       urgent = true;
-    } else if (command == 'X') {
-      urgent = true;
-    } else if ((command == 'A') || (command == 'B') || (command == 'R')) {
-      bridge.canUartOutputEnabled = 1U;
-      Alarm_Clear();
     }
   }
 
   if (CAN_QueueFrame(frame, urgent)) {
+    if (motorCommand && (command == 'D')) {
+      bridge.canUartOutputEnabled = 0U;
+      Alarm_Trigger(ALARM_REASON_ESTOP_CMD);
+    } else if (motorCommand &&
+               ((command == 'A') || (command == 'B') || (command == 'R'))) {
+      bridge.canUartOutputEnabled = 1U;
+      Alarm_ClearReason(ALARM_REASON_ESTOP_CMD);
+    }
     HAL_GPIO_TogglePin(ACTIVITY_LED_GPIO_Port, ACTIVITY_LED_Pin);
   } else {
     UART_QueueError("BUSY");
@@ -640,21 +639,18 @@ static void Bridge_SendHeartbeat(void)
   UART_QueueText(message, false);
 }
 
-static void Alarm_Set(uint8_t active, uint8_t reason)
+static void Alarm_Trigger(uint8_t reason)
 {
-  bridge.alarmActive = active ? 1U : 0U;
-  bridge.alarmReason = bridge.alarmActive ? reason : ALARM_REASON_NONE;
+  bridge.alarmReasons |= reason;
+  bridge.alarmActive = (bridge.alarmReasons != ALARM_REASON_NONE) ? 1U : 0U;
   Alarm_UpdateOutputs();
 }
 
-static void Alarm_Trigger(uint8_t reason)
+static void Alarm_ClearReason(uint8_t reason)
 {
-  Alarm_Set(1U, reason);
-}
-
-static void Alarm_Clear(void)
-{
-  Alarm_Set(0U, ALARM_REASON_NONE);
+  bridge.alarmReasons &= (uint8_t)~reason;
+  bridge.alarmActive = (bridge.alarmReasons != ALARM_REASON_NONE) ? 1U : 0U;
+  Alarm_UpdateOutputs();
 }
 
 static void Alarm_UpdateOutputs(void)
@@ -671,21 +667,47 @@ static void Alarm_UpdateOutputs(void)
 
 static void Alarm_HandleCanFrame(const CanFrame_t *frame)
 {
-  if ((frame->id == CAN_ID_SENSOR_TELEM) && (frame->dlc >= 3U)) {
-    if (frame->data[2] >= SENSOR_VIB_ALARM_PCT) {
+  if ((frame->id == CAN_ID_MOTOR_ACK) && (frame->dlc >= 5U)) {
+    if ((frame->data[1] != 0U) && (frame->data[4] == 0U)) {
+      Alarm_ClearReason(ALARM_REASON_MOTOR_FAULT);
+    }
+    return;
+  }
+
+  if ((frame->id == CAN_ID_SENSOR_TELEM) && (frame->dlc >= 8U)) {
+    bool vibrationAlarm = (frame->data[2] >= SENSOR_VIB_ALARM_PCT);
+    bool sensorFault = (frame->data[3] == 2U) ||
+                       (frame->data[4] == 0U) ||
+                       (frame->data[7] != 0U);
+
+    if (vibrationAlarm) {
       Alarm_Trigger(ALARM_REASON_SENSOR_VIB);
+    } else {
+      Alarm_ClearReason(ALARM_REASON_SENSOR_VIB);
+    }
+
+    if (sensorFault) {
+      Alarm_Trigger(ALARM_REASON_SENSOR_FAULT);
+    } else {
+      Alarm_ClearReason(ALARM_REASON_SENSOR_FAULT);
+    }
+    return;
+  }
+
+  if ((frame->id == CAN_ID_MOTOR_TELEM) && (frame->dlc >= 4U)) {
+    if (frame->data[3] == 0U) {
+      Alarm_ClearReason(ALARM_REASON_MOTOR_FAULT);
+    } else {
+      Alarm_Trigger(ALARM_REASON_MOTOR_FAULT);
     }
     return;
   }
 
   if ((frame->id == CAN_ID_MOTOR_STATUS) && (frame->dlc >= 5U)) {
-    uint8_t faultCode = frame->data[1];
-    uint8_t stoppedByFault = frame->data[4];
-
-    if ((faultCode == 0U) &&
-        (stoppedByFault == 0U) &&
-        (bridge.alarmReason == ALARM_REASON_MOTOR_FAULT)) {
-      Alarm_Clear();
+    if ((frame->data[1] == 0U) && (frame->data[4] == 0U)) {
+      Alarm_ClearReason(ALARM_REASON_MOTOR_FAULT);
+    } else {
+      Alarm_Trigger(ALARM_REASON_MOTOR_FAULT);
     }
     return;
   }
@@ -1071,12 +1093,6 @@ static bool CAN_QueueFrame(const CanFrame_t *frame, bool urgent)
     xQueueSendToFront(canTxQueue, &item, 0U) :
     xQueueSendToBack(canTxQueue, &item, 0U);
 
-  if ((result != pdPASS) && urgent) {
-    CanTxItem_t discarded;
-    (void)xQueueReceive(canTxQueue, &discarded, 0U);
-    result = xQueueSendToFront(canTxQueue, &item, 0U);
-  }
-
   if (result == pdPASS) {
     canTxQueuedCount++;
     return true;
@@ -1236,9 +1252,12 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can)
           (event.frame.id == CAN_ID_SENSOR_FAULT)) {
         urgent = true;
       } else if ((event.frame.id == CAN_ID_SENSOR_TELEM) &&
-                 (event.frame.dlc >= 3U) &&
-                 (event.frame.data[2] >= SENSOR_VIB_ALARM_PCT)) {
-        urgent = true;
+                 (event.frame.dlc >= 3U)) {
+        urgent = (event.frame.data[2] >= SENSOR_VIB_ALARM_PCT) ||
+                 ((event.frame.dlc >= 8U) &&
+                  ((event.frame.data[3] == 2U) ||
+                   (event.frame.data[4] == 0U) ||
+                   (event.frame.data[7] != 0U)));
       }
     }
 
@@ -1247,14 +1266,6 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can)
         bridgeEventQueue, &event, &higherPriorityTaskWoken) :
       xQueueSendToBackFromISR(
         bridgeEventQueue, &event, &higherPriorityTaskWoken);
-
-    if ((result != pdPASS) && urgent) {
-      BridgeEvent_t discarded;
-      (void)xQueueReceiveFromISR(
-        bridgeEventQueue, &discarded, &higherPriorityTaskWoken);
-      result = xQueueSendToFrontFromISR(
-        bridgeEventQueue, &event, &higherPriorityTaskWoken);
-    }
 
     if (result == pdPASS) {
       canRxQueuedCount++;

@@ -54,6 +54,8 @@ static TIM_HandleTypeDef htim2HalTick;
 #define OVERCURRENT_STOP_MS                1000U
 #define DRIVER_FAULT_IGNORE_AFTER_WAKE_MS  100U
 #define DRIVER_FAULT_DEBOUNCE_MS           50U
+#define CURRENT_ADC_FAIL_LIMIT             3U
+#define DIRECTION_CHANGE_BRAKE_MS          100U
 #define CONTROL_PERIOD_MS                  5U
 #define TELEMETRY_PERIOD_MS                500U
 
@@ -68,6 +70,7 @@ static TIM_HandleTypeDef htim2HalTick;
 #define CAN_ID_STATUS_TX                   0x211U
 #define CAN_ID_FAULT_TX                    0x221U
 #define SENSOR_TELEM_ID_RX                 0x202U
+#define SENSOR_FAULT_ID_RX                 0x222U
 
 #define START_MOTOR_ON_BOOT                1
 #define MOTOR_FORWARD_ON_BOOT              1
@@ -114,7 +117,9 @@ typedef enum {
   FAULT_SENSOR_VIBRATION = 3,
   FAULT_REMOTE = 4,
   FAULT_TEST = 5,
-  FAULT_SENSOR_TEMPERATURE = 6
+  FAULT_SENSOR_TEMPERATURE = 6,
+  FAULT_SENSOR_HEALTH = 7,
+  FAULT_CURRENT_SENSOR = 8
 } FaultCode_t;
 
 typedef enum {
@@ -195,6 +200,7 @@ static uint32_t overcurrentStartMs;
 static uint32_t driverFaultIgnoreUntilMs;
 static uint32_t driverFaultLowStartMs;
 static uint32_t lastCanRestartMs;
+static uint8_t currentAdcFailCount;
 
 static volatile uint32_t dbgCanRxQueued;
 static volatile uint32_t dbgCanRxDropped;
@@ -242,7 +248,7 @@ static void MotorControlTask(void *argument);
 static void CanTxTask(void *argument);
 static void TelemetryTask(void *argument);
 
-static uint16_t ADC_ReadCurrentRaw(void);
+static bool ADC_ReadCurrentRaw(uint16_t *raw);
 static uint16_t Current_mA_FromRaw(uint16_t raw);
 static uint8_t ClampPercent(uint8_t percent);
 static void PWM_SetComparePercent(uint8_t percent);
@@ -366,7 +372,6 @@ static void MotorControlTask(void *argument)
 
   (void)argument;
 
-  Motor_DriveBrake();
   Motor_StopBrake();
   Motor_Wake();
 
@@ -458,20 +463,24 @@ static void TelemetryTask(void *argument)
   }
 }
 
-static uint16_t ADC_ReadCurrentRaw(void)
+static bool ADC_ReadCurrentRaw(uint16_t *raw)
 {
+  if (raw == NULL) {
+    return false;
+  }
+
   if (HAL_ADC_Start(&hadc1) != HAL_OK) {
-    return 0U;
+    return false;
   }
 
   if (HAL_ADC_PollForConversion(&hadc1, 1U) != HAL_OK) {
     (void)HAL_ADC_Stop(&hadc1);
-    return 0U;
+    return false;
   }
 
-  uint16_t value = (uint16_t)HAL_ADC_GetValue(&hadc1);
+  *raw = (uint16_t)HAL_ADC_GetValue(&hadc1);
   (void)HAL_ADC_Stop(&hadc1);
-  return value;
+  return true;
 }
 
 static uint16_t Current_mA_FromRaw(uint16_t raw)
@@ -531,6 +540,7 @@ static void Motor_Wake(void)
 static void Motor_Start(MotorDirection_t direction)
 {
   bool wasStopped;
+  bool directionChanging;
 
   if (motor.motorStoppedByFault) {
     return;
@@ -541,10 +551,18 @@ static void Motor_Start(MotorDirection_t direction)
   }
 
   wasStopped = (motor.motorState == MOTOR_STOPPED);
+  directionChanging = !wasStopped && (motor.direction != direction);
+
+  if (directionChanging) {
+    Motor_DriveBrake();
+    motor.speedPercent = 0U;
+    vTaskDelay(pdMS_TO_TICKS(DIRECTION_CHANGE_BRAKE_MS));
+  }
+
   HAL_GPIO_WritePin(DRV_NSLEEP_GPIO_Port, DRV_NSLEEP_Pin, GPIO_PIN_SET);
+  Motor_SelectDirection(direction);
   motor.direction = direction;
   motor.motorState = (direction == DIR_REVERSE) ? MOTOR_REVERSE : MOTOR_FORWARD;
-  Motor_SelectDirection(direction);
   Motor_ApplyTargetSpeed();
   motor.lastRunTickMs = HAL_GetTick();
 
@@ -595,7 +613,6 @@ static void Motor_ApplyTargetSpeed(void)
     return;
   }
 
-  Motor_SelectDirection(motor.direction);
   PWM_SetComparePercent(motor.targetSpeedPercent);
   motor.pwmDutyPercent = motor.targetSpeedPercent;
   motor.speedPercent = motor.targetSpeedPercent;
@@ -603,14 +620,19 @@ static void Motor_ApplyTargetSpeed(void)
 
 static void Motor_LatchFault(FaultCode_t fault)
 {
-  if (motor.faultCode == FAULT_NONE) {
+  bool firstFault = (motor.faultCode == FAULT_NONE);
+
+  if (firstFault) {
     motor.faultCode = fault;
     SAT_U16_INC(motor.faultCount);
-    CAN_SendFault(fault);
   }
 
   motor.motorStoppedByFault = true;
   Motor_StopBrake();
+
+  if (firstFault) {
+    CAN_SendFault(fault);
+  }
 }
 
 static void Motor_ResetFaults(void)
@@ -622,11 +644,25 @@ static void Motor_ResetFaults(void)
   motor.testMode = false;
   overcurrentStartMs = 0U;
   driverFaultLowStartMs = 0U;
+  currentAdcFailCount = 0U;
 }
 
 static void Motor_UpdateSafety(uint32_t nowMs)
 {
-  motor.current_mA = Current_mA_FromRaw(ADC_ReadCurrentRaw());
+  uint16_t raw;
+
+  if (ADC_ReadCurrentRaw(&raw)) {
+    motor.current_mA = Current_mA_FromRaw(raw);
+    currentAdcFailCount = 0U;
+  } else {
+    if (currentAdcFailCount < UINT8_MAX) {
+      currentAdcFailCount++;
+    }
+    if (currentAdcFailCount >= CURRENT_ADC_FAIL_LIMIT) {
+      Motor_LatchFault(FAULT_CURRENT_SENSOR);
+    }
+  }
+
   Motor_UpdateDriverFault(nowMs);
   Motor_UpdateCurrent(nowMs);
   Motor_UpdateTestFault(nowMs);
@@ -686,7 +722,7 @@ static void Motor_UpdateTestFault(uint32_t nowMs)
 
 static void Motor_UpdateRuntime(uint32_t nowMs)
 {
-  if (motor.motorState == MOTOR_STOPPED) {
+  if ((motor.motorState == MOTOR_STOPPED) || (motor.pwmDutyPercent == 0U)) {
     motor.lastRunTickMs = nowMs;
     return;
   }
@@ -898,13 +934,23 @@ static void Control_HandleRxFrame(const CanFrame_t *frame)
   if ((frame->stdId == SENSOR_TELEM_ID_RX) && (frame->dlc >= 3U)) {
     int16_t temp_x100 =
       (int16_t)((uint16_t)frame->data[0] | ((uint16_t)frame->data[1] << 8U));
+    bool sensorFault = (frame->dlc >= 8U) &&
+                       ((frame->data[3] == 2U) || (frame->data[7] != 0U));
 
     if ((temp_x100 > SENSOR_TEMP_STOP_X100) && !motor.motorStoppedByFault) {
       Motor_LatchFault(FAULT_SENSOR_TEMPERATURE);
     } else if ((frame->data[2] >= SENSOR_VIB_STOP_PCT) &&
                !motor.motorStoppedByFault) {
       Motor_LatchFault(FAULT_SENSOR_VIBRATION);
+    } else if (sensorFault && !motor.motorStoppedByFault) {
+      Motor_LatchFault(FAULT_SENSOR_HEALTH);
     }
+    return;
+  }
+
+  if ((frame->stdId == SENSOR_FAULT_ID_RX) && (frame->dlc >= 1U) &&
+      !motor.motorStoppedByFault) {
+    Motor_LatchFault(FAULT_SENSOR_HEALTH);
   }
 }
 
@@ -1101,12 +1147,12 @@ static void CAN_ConfigFilters(void)
   CAN_FilterTypeDef filter = {0};
 
   filter.FilterBank = 0;
-  filter.FilterMode = CAN_FILTERMODE_IDMASK;
-  filter.FilterScale = CAN_FILTERSCALE_32BIT;
-  filter.FilterIdHigh = 0x0000U;
-  filter.FilterIdLow = 0x0000U;
-  filter.FilterMaskIdHigh = 0x0000U;
-  filter.FilterMaskIdLow = 0x0000U;
+  filter.FilterMode = CAN_FILTERMODE_IDLIST;
+  filter.FilterScale = CAN_FILTERSCALE_16BIT;
+  filter.FilterIdHigh = (uint16_t)(CAN_ID_CMD_RX << 5U);
+  filter.FilterIdLow = (uint16_t)(SENSOR_TELEM_ID_RX << 5U);
+  filter.FilterMaskIdHigh = (uint16_t)(SENSOR_FAULT_ID_RX << 5U);
+  filter.FilterMaskIdLow = (uint16_t)(CAN_ID_CMD_RX << 5U);
   filter.FilterFIFOAssignment = CAN_RX_FIFO0;
   filter.FilterActivation = ENABLE;
   filter.SlaveStartFilterBank = 14;
@@ -1322,25 +1368,21 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can)
     frame.dlc = (header.DLC > 8U) ? 8U : (uint8_t)header.DLC;
 
     if ((frame.stdId == CAN_ID_CMD_RX) && (frame.dlc > 0U)) {
-      char command = ToUpperAscii((char)frame.data[0]);
-      urgent = (command == 'D') || (command == 'X');
+      urgent = (Command_FromPayload(frame.data, frame.dlc) != CMD_NONE);
     } else if ((frame.stdId == SENSOR_TELEM_ID_RX) && (frame.dlc >= 3U)) {
       int16_t temp =
         (int16_t)((uint16_t)frame.data[0] | ((uint16_t)frame.data[1] << 8U));
       urgent = (temp > SENSOR_TEMP_STOP_X100) ||
-               (frame.data[2] >= SENSOR_VIB_STOP_PCT);
+               (frame.data[2] >= SENSOR_VIB_STOP_PCT) ||
+               ((frame.dlc >= 8U) &&
+                ((frame.data[3] == 2U) || (frame.data[7] != 0U)));
+    } else if (frame.stdId == SENSOR_FAULT_ID_RX) {
+      urgent = true;
     }
 
     queued = urgent ?
       xQueueSendToFrontFromISR(canRxQueue, &frame, &higherPriorityTaskWoken) :
       xQueueSendToBackFromISR(canRxQueue, &frame, &higherPriorityTaskWoken);
-
-    if ((queued != pdPASS) && urgent) {
-      CanFrame_t discarded;
-      (void)xQueueReceiveFromISR(canRxQueue, &discarded, &higherPriorityTaskWoken);
-      queued = xQueueSendToFrontFromISR(
-        canRxQueue, &frame, &higherPriorityTaskWoken);
-    }
 
     if (queued == pdPASS) {
       dbgCanRxQueued++;

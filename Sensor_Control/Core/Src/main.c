@@ -43,6 +43,7 @@ static TIM_HandleTypeDef htim2HalTick;
 #define DS_CONVERSION_MS                  800U
 #define DS_RETRY_MS                       100U
 #define SENSOR_FAIL_LIMIT                 10U
+#define PIEZO_ADC_FAIL_LIMIT               10U
 #define TEMP_MIN_X100                     (-5500)
 #define TEMP_MAX_X100                     12500
 
@@ -75,7 +76,6 @@ static TIM_HandleTypeDef htim2HalTick;
 
 typedef enum {
   SYS_NORMAL = 0,
-  SYS_WARNING = 1,
   SYS_ERROR = 2
 } SystemState_t;
 
@@ -83,7 +83,8 @@ typedef enum {
   FAULT_NONE = 0,
   FAULT_REMOTE = 1,
   FAULT_TEST = 2,
-  FAULT_TEMP_SENSOR = 3
+  FAULT_TEMP_SENSOR = 3,
+  FAULT_PIEZO_SENSOR = 4
 } FaultCode_t;
 
 typedef enum {
@@ -154,6 +155,7 @@ static SensorContext_t sensor = {
 };
 
 static uint8_t sensorFailCount;
+static uint8_t piezoAdcFailCount;
 static uint32_t lastCanRestartMs;
 
 static volatile uint32_t dbgEventQueued;
@@ -201,7 +203,7 @@ static void CanTxTask(void *argument);
 static void TemperatureTask(void *argument);
 static void TelemetryTask(void *argument);
 
-static uint16_t ADC_ReadPiezoRaw(void);
+static bool ADC_ReadPiezoRaw(uint16_t *raw);
 static uint32_t Piezo_RawToPercent(uint32_t raw);
 static void Sensor_ProcessEvent(const SensorEvent_t *event);
 static void Sensor_ProcessCommand(Command_t command);
@@ -336,10 +338,21 @@ static void SensorControlTask(void *argument)
 
     now = xTaskGetTickCount();
     if ((int32_t)(now - nextSample) >= 0) {
-      uint32_t raw = ADC_ReadPiezoRaw();
+      uint16_t raw;
 
-      if (raw > sensor.vibrationPeakRaw) {
-        sensor.vibrationPeakRaw = raw;
+      if (ADC_ReadPiezoRaw(&raw)) {
+        piezoAdcFailCount = 0U;
+        if (raw > sensor.vibrationPeakRaw) {
+          sensor.vibrationPeakRaw = raw;
+        }
+      } else {
+        if (piezoAdcFailCount < UINT8_MAX) {
+          piezoAdcFailCount++;
+        }
+        if ((piezoAdcFailCount >= PIEZO_ADC_FAIL_LIMIT) &&
+            (sensor.fault == FAULT_NONE)) {
+          Sensor_LatchFault(FAULT_PIEZO_SENSOR);
+        }
       }
       Sensor_UpdateTestFault(HAL_GetTick());
 
@@ -442,21 +455,23 @@ static void TelemetryTask(void *argument)
   }
 }
 
-static uint16_t ADC_ReadPiezoRaw(void)
+static bool ADC_ReadPiezoRaw(uint16_t *raw)
 {
-  uint16_t value;
+  if (raw == NULL) {
+    return false;
+  }
 
   if (HAL_ADC_Start(&hadc1) != HAL_OK) {
-    return 0U;
+    return false;
   }
   if (HAL_ADC_PollForConversion(&hadc1, 1U) != HAL_OK) {
     (void)HAL_ADC_Stop(&hadc1);
-    return 0U;
+    return false;
   }
 
-  value = (uint16_t)HAL_ADC_GetValue(&hadc1);
+  *raw = (uint16_t)HAL_ADC_GetValue(&hadc1);
   (void)HAL_ADC_Stop(&hadc1);
-  return value;
+  return true;
 }
 
 static uint32_t Piezo_RawToPercent(uint32_t raw)
@@ -497,7 +512,9 @@ static void Sensor_ProcessEvent(const SensorEvent_t *event)
         Piezo_RawToPercent(sensor.vibrationPeakRaw);
       sensor.vibrationPeakRaw = 0U;
 
-      if (sensor.streamEnabled || (sensor.state == SYS_ERROR)) {
+      /* 0x202 is also the inter-node safety channel, so X only changes the
+       * public stream flag; safety telemetry remains active on the CAN bus. */
+      if (sensor.temperatureValid || (sensor.state == SYS_ERROR)) {
         CAN_SendTelemetry();
       }
       break;
@@ -620,6 +637,7 @@ static void Sensor_ResetFaults(void)
   sensor.vibrationPercent = 0U;
   sensor.vibrationPeakRaw = 0U;
   sensorFailCount = 0U;
+  piezoAdcFailCount = 0U;
 }
 
 static Command_t Command_FromChar(char value)
@@ -1194,14 +1212,6 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can)
         sensorEventQueue, &event, &higherPriorityTaskWoken) :
       xQueueSendToBackFromISR(
         sensorEventQueue, &event, &higherPriorityTaskWoken);
-
-    if ((queued != pdPASS) && urgent) {
-      SensorEvent_t discarded;
-      (void)xQueueReceiveFromISR(
-        sensorEventQueue, &discarded, &higherPriorityTaskWoken);
-      queued = xQueueSendToFrontFromISR(
-        sensorEventQueue, &event, &higherPriorityTaskWoken);
-    }
 
     if (queued == pdPASS) {
       dbgEventQueued++;

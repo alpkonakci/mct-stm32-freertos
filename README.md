@@ -112,6 +112,8 @@ DRV8876, PMODE düşük olacak şekilde PH/EN modunda kullanılmaktadır. EN gir
 
 Motor açılışta ileri yönde yüzde 80 hedef hız ile başlar. `U` ve `N` komutları hedef PWM'i 20 puan artırır veya azaltır. Sınırlar yüzde 0 ve yüzde 100'dür.
 
+Motor çalışırken yön değiştirildiğinde PWM önce sıfırlanır, 100 ms frenleme beklenir, ardından PH yön pini değiştirilerek hedef PWM yeniden uygulanır.
+
 ### Motor komutları
 
 | Komut | İşlem |
@@ -134,6 +136,8 @@ Motor açılışta ileri yönde yüzde 80 hedef hız ile başlar. `U` ve `N` kom
 - Sensör telemetrisi `40.00 C` üzerindeyse motor durur.
 - Titreşim yüzde `80` veya üzerindeyse motor durur.
 - `PA6 nFAULT` düşük seviyesi 50 ms debounce sonrasında motoru durdurur.
+- Akım ADC'si art arda üç kez okunamazsa ölçüm sıfır kabul edilmez; motor `FAULT_CURRENT_SENSOR` ile güvenli biçimde durdurulur.
+- Sensör `0x202` durum/fault alanları hata bildirirse veya `0x222` fault çerçevesi gelirse motor durur.
 
 Motor üzerinde enkoder bulunmadığı için gerçek RPM ölçülmez. `0x203` çerçevesi PWM/hız yüzdesini taşır. Yüzdeden hesaplanan RPM yalnızca tahmindir; gerçek RPM için enkoder veya Hall sensörü gerekir.
 
@@ -170,7 +174,7 @@ DS18B20 DATA ile 3.3 V arasına harici `4.7 kohm` pull-up bağlanmalıdır. PA1 
 | `Temperature` | 3 | 320 word | Bloklamayan DS18B20 dönüşüm akışı |
 | `Telemetry` | 2 | 160 word | 500 ms telemetri olayı |
 
-Piezo 1 ms aralıkla örneklenir. DS18B20 dönüşümü için 800 ms beklenir ve scratchpad CRC kontrol edilir. En son geçerli sıcaklık doğrudan telemetriye aktarılır; güvenlik kararını geciktiren hareketli ortalama kullanılmaz. Arka arkaya 10 okuma hatası sensör fault üretir.
+Piezo 1 ms aralıkla örneklenir. DS18B20 dönüşümü için 800 ms beklenir ve scratchpad CRC kontrol edilir. En son geçerli sıcaklık doğrudan telemetriye aktarılır; güvenlik kararını geciktiren hareketli ortalama kullanılmaz. Arka arkaya 10 DS18B20 okuma hatası sıcaklık sensörü fault'u, art arda 10 piezo ADC okuma hatası piezo sensörü fault'u üretir.
 
 `0x202` payload:
 
@@ -178,13 +182,13 @@ Piezo 1 ms aralıkla örneklenir. DS18B20 dönüşümü için 800 ms beklenir ve
 |---:|---|
 | 0-1 | Sıcaklık x100, signed int16 little-endian |
 | 2 | Titreşim yüzdesi |
-| 3 | Sistem state: 0 normal, 1 warning, 2 error |
+| 3 | Sistem state: 0 normal, 2 error |
 | 4 | Genel sensör sağlığı: 1 normal, 0 hata |
 | 5 | Stream açık bayrağı |
 | 6 | Test modu bayrağı |
 | 7 | Fault kodu |
 
-Sensör komutları: `A` stream aç, `X` stream kapat, `D` remote fault, `R` reset, `T` test, `F` flush ACK, `I/S` durum isteği.
+Sensör komutları: `A` stream bayrağını aç, `X` stream bayrağını kapat, `D` remote fault, `R` reset, `T` test, `F` flush ACK, `I/S` durum isteği. `0x202` aynı zamanda düğümler arası güvenlik kanalıdır; ilk geçerli sıcaklık ölçümünden sonra `X` komutuna rağmen CAN güvenlik telemetrisi devam eder.
 
 ## Bridge Control
 
@@ -234,13 +238,14 @@ CAN'dan alınan veri UART'a şu biçimde çıkar:
 <HB,1000,1,rx_count,tx_count,error,tec,rec,lec>
 ```
 
-`D` komutu CAN-UART veri akışını durdurur; heartbeat devam eder. `R`, `A` veya `B` komutu veri akışını yeniden açar ve bridge alarmını temizler. `R` motoru çalıştırmaz. `A/B` motoru çalıştırır.
+Motor düğümüne gönderilen `D` komutu CAN-UART veri akışını durdurur; heartbeat devam eder. Motor `R`, `A` veya `B` komutu kuyruğa başarıyla alındığında veri akışı yeniden açılır ve yalnızca acil-durdurma alarm nedeni temizlenir. `R` motoru çalıştırmaz; `A/B` motoru çalıştırır. Sensör `A/R` komutları motor veya acil-durdurma alarmını temizlemez.
 
 Bridge alarmı:
 
 - Acil durdur komutu, motor fault, sensör fault veya yüksek titreşim alarmı kırmızı LED ve buzzer'ı açar.
 - Alarm aktifken yeşil LED söner.
-- Sağlıklı motor status çerçevesi yalnızca motor-fault kaynaklı alarmı temizleyebilir; sensör ve acil durdur alarmlarını yanlışlıkla temizlemez.
+- Alarm nedenleri bit maskesiyle birlikte tutulur; yeni bir alarm önceki nedeni ezmez.
+- Sağlıklı motor telemetrisi yalnızca motor-fault nedenini, sağlıklı sensör telemetrisi yalnızca sensör/titreşim nedenlerini temizler.
 
 ## FreeRTOS ve CubeMX
 
@@ -444,6 +449,8 @@ The DRV8876 is used in PH/EN mode with PMODE held low. PWM on EN controls the du
 
 The motor starts forward at an 80 percent target duty cycle after reset. `U` and `N` change the target by 20 percentage points, clamped to 0-100 percent.
 
+When direction changes while running, PWM is first set to zero, braking is held for 100 ms, and only then is the PH direction pin changed and target PWM restored.
+
 | Command | Action |
 |---|---|
 | `A` | Start forward; optional byte 1 sets speed percent |
@@ -462,6 +469,8 @@ Safety behavior:
 - Stop when sensor telemetry reports a temperature above 40.00 C.
 - Stop when vibration reaches or exceeds 80 percent.
 - Stop when PA6 nFAULT remains low after the 50 ms debounce interval.
+- Stop with `FAULT_CURRENT_SENSOR` after three consecutive current-ADC read failures instead of interpreting an ADC failure as zero current.
+- Stop when sensor telemetry reports an error/fault state or when a `0x222` sensor-fault frame is received.
 
 There is no encoder in the current hardware, so the firmware does not measure actual RPM. Frame `0x203` reports PWM and speed percentages. RPM calculated from duty cycle is only an estimate; measured RPM requires an encoder or Hall sensor.
 
@@ -498,7 +507,7 @@ Connect an external 4.7 kohm pull-up resistor between DS18B20 DATA and 3.3 V. Co
 | `Temperature` | 3 | 320 words | Non-blocking DS18B20 conversion sequence |
 | `Telemetry` | 2 | 160 words | 500 ms telemetry events |
 
-The piezo input is sampled every 1 ms. DS18B20 conversion time is 800 ms and scratchpad CRC is validated. The latest valid temperature is published directly so that the motor's 40 C safety decision is not delayed by a moving average. Ten consecutive read failures latch a temperature sensor fault.
+The piezo input is sampled every 1 ms. DS18B20 conversion time is 800 ms and scratchpad CRC is validated. The latest valid temperature is published directly so that the motor's 40 C safety decision is not delayed by a moving average. Ten consecutive DS18B20 failures latch a temperature-sensor fault, and ten consecutive piezo ADC failures latch a piezo-sensor fault.
 
 `0x202` payload:
 
@@ -506,13 +515,13 @@ The piezo input is sampled every 1 ms. DS18B20 conversion time is 800 ms and scr
 |---:|---|
 | 0-1 | Temperature x100, signed int16 little-endian |
 | 2 | Vibration percentage |
-| 3 | System state: 0 normal, 1 warning, 2 error |
+| 3 | System state: 0 normal, 2 error |
 | 4 | Overall health: 1 normal, 0 fault |
 | 5 | Stream-enabled flag |
 | 6 | Test-mode flag |
 | 7 | Fault code |
 
-Sensor commands are `A` stream on, `X` stream off, `D` remote fault, `R` reset, `T` test, `F` flush ACK, and `I/S` status request.
+Sensor commands are `A` stream flag on, `X` stream flag off, `D` remote fault, `R` reset, `T` test, `F` flush ACK, and `I/S` status request. Frame `0x202` is also the inter-node safety channel, so after the first valid temperature sample its CAN safety telemetry continues even when `X` clears the public stream flag.
 
 ### Bridge Control
 
@@ -562,9 +571,9 @@ CAN-to-UART output examples:
 <HB,1000,1,rx_count,tx_count,error,tec,rec,lec>
 ```
 
-Command `D` disables CAN-to-UART frame output while heartbeat remains active. Commands `R`, `A`, and `B` restore frame output and clear the bridge alarm. `R` does not start the motor; `A/B` start it.
+Motor command `D` disables CAN-to-UART frame output while heartbeat remains active. Once a motor `R`, `A`, or `B` command is queued successfully, frame output resumes and only the emergency-stop alarm reason is cleared. `R` leaves the motor stopped; `A/B` start it. Sensor `A/R` commands do not clear motor or emergency-stop alarms.
 
-Emergency stop, motor fault, sensor fault, or high vibration turns on the red LED and active buzzer and turns off the green LED. A healthy motor status frame can clear only a motor-fault alarm; it cannot incorrectly clear an emergency-stop or sensor alarm.
+Emergency stop, motor fault, sensor fault, or high vibration turns on the red LED and active buzzer and turns off the green LED. Alarm reasons are stored as a bit mask, so one alarm cannot overwrite another. Healthy motor telemetry clears only the motor-fault reason; healthy sensor telemetry clears only sensor/vibration reasons.
 
 ### FreeRTOS and CubeMX Notes
 
